@@ -1,0 +1,27 @@
+# Transcript extraction
+youtube-transcript-api
+yt-dlp
+
+# Speech-to-text fallback
+faster-whisper
+
+# NLP - Summarization
+transformers
+torch
+sentencepiece
+
+# NLP - Keyword extraction
+keybert
+
+# Text chunking
+nltk
+
+# Backend API
+fastapi
+uvicorn
+python-multipart
+pydantic
+
+# Frontend
+streamlit
+requests
