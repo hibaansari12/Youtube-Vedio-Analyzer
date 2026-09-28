@@ -1,4 +1,5 @@
 import sys
+from html import escape
 from pathlib import Path
 
 import streamlit as st
@@ -16,129 +17,218 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Styling — dark, high-contrast professional theme. Every color below is
-# set explicitly (not inherited from Streamlit's base theme) so text never
-# ends up low-contrast regardless of the user's system/browser theme.
+# Design tokens
 # ---------------------------------------------------------------------------
-BG = "#F6F5F2"
+BG = "#F3F1F9"
 PANEL = "#FFFFFF"
-BORDER = "#E2DFD8"
-TEXT = "#1B1D21"
-MUTED = "#666B72"
-ACCENT = "#2F4B7C"
-ACCENT_DIM = "rgba(47, 75, 124, 0.08)"
+BORDER = "#E0DCEE"
+TEXT = "#191627"
+MUTED = "#605B77"
+FAINT = "#8E89A6"
+ACCENT = "#4B3F9E"
+ACCENT_HOVER = "#3B3180"
+ACCENT_SOFT = "#ECE9F8"
+ACCENT_LINE = "#CFC9EC"
 
 st.markdown(
     f"""
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600;8..60,700&display=swap');
+
+    /* ---------- Base ---------- */
     #MainMenu, footer, header {{ visibility: hidden; }}
-
     .stApp {{ background-color: {BG} !important; }}
-    .block-container {{ max-width: 720px; padding-top: 3rem; padding-bottom: 4rem; }}
-
-    html, body, [class*="css"], p, span, div, label, h1, h2, h3, h4 {{
-        font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    .block-container {{
+        max-width: 760px;
+        padding-top: 3.5rem;
+        padding-bottom: 5rem;
+    }}
+    html, body, [class*="css"], p, span, div, label, li {{
+        font-family: "Source Sans 3", -apple-system, "Segoe UI", Roboto, sans-serif;
         color: {TEXT} !important;
     }}
 
-    .eyebrow {{
-        font-size: 0.82rem;
-        color: {ACCENT} !important;
-        background: {ACCENT_DIM};
-        border: 1px solid rgba(47, 75, 124, 0.25);
-        display: inline-block;
-        padding: 0.3rem 0.8rem;
-        border-radius: 6px;
-        margin-bottom: 1.2rem;
+    /* ---------- Header ---------- */
+    .brand {{
+        display: flex; align-items: center; gap: 0.6rem;
+        margin-bottom: 2.2rem;
+    }}
+    .brand-mark {{
+        width: 30px; height: 30px; border-radius: 8px;
+        background: {ACCENT};
+        display: flex; align-items: center; justify-content: center;
+        color: #FFFFFF !important; font-size: 0.85rem; line-height: 1;
+    }}
+    .brand-name {{ font-weight: 600; font-size: 0.98rem; color: {TEXT} !important; }}
+    .brand-tag {{
+        font-size: 0.85rem; color: {FAINT} !important;
+        padding-left: 0.6rem; margin-left: 0.2rem;
+        border-left: 1px solid {BORDER};
     }}
     h1.page-title {{
-        font-size: 2.25rem;
-        font-weight: 700;
+        font-family: "Source Serif 4", Georgia, serif !important;
+        font-size: 2.6rem;
+        font-weight: 600;
+        line-height: 1.15;
+        letter-spacing: -0.5px;
         color: {TEXT} !important;
-        letter-spacing: -0.3px;
-        margin: 0 0 0.7rem 0;
+        margin: 0 0 0.9rem 0;
+        padding: 0;
     }}
     p.page-lede {{
         color: {MUTED} !important;
-        font-size: 1rem;
-        max-width: 560px;
-        margin-bottom: 2rem;
+        font-size: 1.08rem;
+        line-height: 1.6;
+        max-width: 580px;
+        margin: 0 0 2.2rem 0;
     }}
 
-    div[data-baseweb="tab-list"] {{ gap: 1.5rem; border-bottom: 1px solid {BORDER}; }}
-    button[data-baseweb="tab"] p {{ font-size: 0.95rem; color: {MUTED} !important; font-weight: 500; }}
-    button[data-baseweb="tab"][aria-selected="true"] p {{ color: {TEXT} !important; font-weight: 700; }}
-    div[data-baseweb="tab-highlight"] {{ background-color: {ACCENT} !important; }}
+    /* ---------- Input panel ---------- */
+    div[data-testid="stTabs"] {{
+        background: {PANEL};
+        border: 1px solid {BORDER};
+        border-radius: 12px;
+        padding: 0.4rem 1.4rem 1.4rem 1.4rem;
+        box-shadow: 0 1px 2px rgba(20, 24, 31, 0.04);
+    }}
+    div[data-baseweb="tab-list"] {{
+        gap: 1.6rem;
+        border-bottom: 1px solid {BORDER};
+        margin-bottom: 1rem;
+    }}
+    button[data-baseweb="tab"] {{ padding-left: 0; padding-right: 0; }}
+    button[data-baseweb="tab"] p {{
+        font-size: 0.95rem; color: {MUTED} !important; font-weight: 500;
+    }}
+    button[data-baseweb="tab"][aria-selected="true"] p {{
+        color: {TEXT} !important; font-weight: 600;
+    }}
+    div[data-baseweb="tab-highlight"] {{ background-color: {ACCENT} !important; height: 2px; }}
+    div[data-baseweb="tab-border"] {{ display: none; }}
 
-    .stTextInput input, .stTextArea textarea {{
+    /* Streamlit wraps inputs in extra baseweb divs; style those, not just the <input> */
+    div[data-baseweb="input"], div[data-baseweb="base-input"], div[data-baseweb="textarea"] {{
         background: {PANEL} !important;
-        border-radius: 8px;
+        border-radius: 8px !important;
         border: 1px solid {BORDER} !important;
-        color: {TEXT} !important;
-        font-size: 0.95rem;
+        box-shadow: none !important;
     }}
-    .stTextInput input::placeholder, .stTextArea textarea::placeholder {{ color: #9A9EA4 !important; }}
-    .stTextInput input:focus, .stTextArea textarea:focus {{
+    div[data-baseweb="input"]:focus-within,
+    div[data-baseweb="textarea"]:focus-within {{
         border-color: {ACCENT} !important;
-        box-shadow: 0 0 0 1px {ACCENT};
+        box-shadow: 0 0 0 3px {ACCENT_SOFT} !important;
+    }}
+    .stTextInput input, .stTextArea textarea {{
+        background: transparent !important;
+        color: {TEXT} !important;
+        font-size: 1rem;
+        padding: 0.7rem 0.85rem;
+    }}
+    .stTextInput input::placeholder, .stTextArea textarea::placeholder {{
+        color: {FAINT} !important;
     }}
 
+    /* ---------- Button ---------- */
+    .stButton {{ margin-top: 1rem; }}
     .stButton button {{
         background: {ACCENT} !important;
+        border: none !important;
         border-radius: 8px;
-        border: none;
-        padding: 0.65rem 1.4rem;
-        font-weight: 700;
+        padding: 0.7rem 1.4rem;
         width: 100%;
+        transition: background 0.15s ease;
     }}
-    .stButton button p {{ color: #FFFFFF !important; }}
-    .stButton button:hover {{ background: #24395F !important; }}
+    .stButton button p {{ color: #FFFFFF !important; font-weight: 600; font-size: 1rem; }}
+    .stButton button:hover {{ background: {ACCENT_HOVER} !important; }}
+    .stButton button:focus-visible {{
+        outline: 3px solid {ACCENT_LINE} !important; outline-offset: 2px;
+    }}
+
+    /* ---------- Process steps (shown before first result) ---------- */
+    .steps {{
+        display: grid; grid-template-columns: repeat(3, 1fr);
+        gap: 1rem; margin-top: 2.2rem;
+    }}
+    .step {{ border-top: 2px solid {ACCENT_LINE}; padding-top: 0.8rem; }}
+    .step b {{ display: block; font-size: 0.95rem; margin-bottom: 0.25rem; }}
+    .step span {{ font-size: 0.88rem; color: {MUTED} !important; line-height: 1.5; }}
+    @media (max-width: 640px) {{
+        .steps {{ grid-template-columns: 1fr; }}
+        h1.page-title {{ font-size: 2.1rem; }}
+    }}
+
+    /* ---------- Results ---------- */
+    .stats {{
+        display: grid; grid-template-columns: repeat(3, 1fr);
+        gap: 1rem; margin: 2.2rem 0 1rem 0;
+    }}
+    .stat {{
+        background: {PANEL};
+        border: 1px solid {BORDER};
+        border-radius: 10px;
+        padding: 0.9rem 1.1rem;
+    }}
+    .stat .label {{ font-size: 0.8rem; color: {MUTED} !important; margin-bottom: 0.15rem; }}
+    .stat .value {{
+        font-family: "Source Serif 4", Georgia, serif;
+        font-size: 1.5rem; font-weight: 600; color: {TEXT} !important;
+    }}
 
     .result-card {{
         background: {PANEL};
         border: 1px solid {BORDER};
-        border-radius: 10px;
-        padding: 1.3rem 1.5rem;
+        border-radius: 12px;
+        padding: 1.6rem 1.8rem;
         margin-bottom: 1rem;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+        box-shadow: 0 1px 2px rgba(20, 24, 31, 0.04);
     }}
     .result-card h4 {{
-        font-size: 0.8rem;
-        letter-spacing: 0.02em;
-        color: {ACCENT} !important;
-        margin: 0 0 0.7rem 0;
-        font-weight: 700;
+        font-size: 1rem;
+        font-weight: 600;
+        color: {TEXT} !important;
+        margin: 0 0 0.9rem 0;
+        padding: 0 0 0.7rem 0;
+        border-bottom: 1px solid {BORDER};
     }}
-    .meta-row {{ font-size: 0.8rem; color: {MUTED} !important; margin-bottom: 0.9rem; }}
-    .summary-text {{ font-size: 0.98rem; color: {TEXT} !important; line-height: 1.65; }}
+    .summary-text {{
+        font-family: "Source Serif 4", Georgia, serif;
+        font-size: 1.08rem;
+        line-height: 1.75;
+        color: {TEXT} !important;
+    }}
 
     .kw-chip {{
         display: inline-block;
-        background: {ACCENT_DIM};
-        border: 1px solid rgba(47, 75, 124, 0.25);
+        background: {ACCENT_SOFT};
+        border: 1px solid {ACCENT_LINE};
         color: {TEXT} !important;
-        font-size: 0.83rem;
-        padding: 0.3rem 0.75rem;
-        border-radius: 6px;
-        margin: 0 0.4rem 0.4rem 0;
-    }}
-    .kw-chip b {{ color: {ACCENT} !important; }}
-
-    .future-card {{
-        border: 1px solid {BORDER};
-        border-left: 3px solid {ACCENT};
-        border-radius: 8px;
-        padding: 1rem 1.2rem;
-        color: {MUTED} !important;
         font-size: 0.9rem;
-        background: {PANEL};
+        padding: 0.3rem 0.8rem;
+        border-radius: 999px;
+        margin: 0 0.45rem 0.5rem 0;
     }}
-    .future-card b {{ color: {TEXT} !important; }}
+    .kw-chip i {{ font-style: normal; color: {ACCENT} !important; font-weight: 600; margin-left: 0.35rem; }}
 
-    [data-testid="stExpander"] {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 8px; }}
-    [data-testid="stExpander"] summary {{ color: {TEXT} !important; }}
+    [data-testid="stExpander"] {{
+        background: {PANEL};
+        border: 1px solid {BORDER} !important;
+        border-radius: 10px;
+    }}
+    [data-testid="stExpander"] summary {{ font-weight: 600; }}
 
-    hr {{ border-color: {BORDER}; }}
+    /* ---------- Footer note ---------- */
+    .future-note {{
+        margin-top: 1rem;
+        padding: 1rem 1.2rem;
+        border-left: 3px solid {ACCENT};
+        background: {PANEL};
+        border-radius: 0 8px 8px 0;
+        font-size: 0.92rem; line-height: 1.6;
+        color: {MUTED} !important;
+    }}
+    .future-note b {{ color: {TEXT} !important; }}
+    .section-title {{ font-weight: 600; font-size: 0.95rem; margin: 0; }}
+    hr {{ border-color: {BORDER}; margin: 2.5rem 0 1.5rem 0; }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -147,12 +237,21 @@ st.markdown(
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
-st.markdown('<div class="eyebrow">NLP · Summarization · Keyword Extraction</div>', unsafe_allow_html=True)
-st.markdown('<h1 class="page-title">Video Analyzer</h1>', unsafe_allow_html=True)
 st.markdown(
-    '<p class="page-lede">Paste a YouTube link or a transcript. The pipeline pulls the '
-    "transcript (captions, with a Whisper fallback), chunks long videos, and generates "
-    "a summary and keywords.</p>",
+    """
+    <div class="brand">
+        <div class="brand-mark">▸</div>
+        <span class="brand-name">Video Analyzer</span>
+        <span class="brand-tag">Summaries and keywords from any talk</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+st.markdown('<h1 class="page-title">Understand a video in under a minute.</h1>', unsafe_allow_html=True)
+st.markdown(
+    '<p class="page-lede">Paste a YouTube link or a transcript. We pull the captions '
+    "(with a Whisper fallback), break long videos into sections, and return a clear "
+    "summary with the key topics.</p>",
     unsafe_allow_html=True,
 )
 
@@ -174,6 +273,7 @@ with tab_transcript:
     )
 
 run = st.button("Analyze video", use_container_width=True)
+
 
 # ---------------------------------------------------------------------------
 # Cache the heavy model load across reruns/analyses (not across restarts).
@@ -211,7 +311,7 @@ if run:
                     source = "pasted"
 
                 if len(transcript_text.split()) < 5:
-                    st.error("That transcript looks too short to analyze.")
+                    st.error("That transcript is too short to analyze. Add at least a few sentences.")
                 else:
                     summary_data = summarize_long_text(transcript_text)
                     kw = extract_keywords(transcript_text)
@@ -230,26 +330,37 @@ if run:
                 st.error(f"Couldn't analyze this: {e}")
 
 # ---------------------------------------------------------------------------
-# Results
+# Results (or, before the first run, a short explanation of the pipeline)
 # ---------------------------------------------------------------------------
 if "result" in st.session_state:
     data = st.session_state["result"]
 
     st.markdown(
         f"""
+        <div class="stats">
+            <div class="stat"><div class="label">Length</div>
+                <div class="value">{data['word_count']:,} words</div></div>
+            <div class="stat"><div class="label">Sections analyzed</div>
+                <div class="value">{data['chunk_count']}</div></div>
+            <div class="stat"><div class="label">Transcript source</div>
+                <div class="value">{escape(str(data['transcript_source']).capitalize())}</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        f"""
         <div class="result-card">
             <h4>Summary</h4>
-            <div class="meta-row">
-                {data['word_count']:,} words · {data['chunk_count']} chunk(s) · source: {data['transcript_source']}
-            </div>
-            <div class="summary-text">{data['summary']}</div>
+            <div class="summary-text">{escape(str(data['summary']))}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     kw_html = "".join(
-        f'<span class="kw-chip">{k["keyword"]} <b>· {k["relevance"]}</b></span>'
+        f'<span class="kw-chip">{escape(str(k["keyword"]))}<i>{escape(str(k["relevance"]))}</i></span>'
         for k in data["keywords"]
     ) or f'<span style="color:{MUTED};">No keywords extracted.</span>'
 
@@ -264,20 +375,34 @@ if "result" in st.session_state:
     )
 
     if data.get("chunk_summaries") and len(data["chunk_summaries"]) > 1:
-        with st.expander("View per-chunk summaries"):
+        with st.expander("View summary of each section"):
             for i, chunk in enumerate(data["chunk_summaries"], 1):
-                st.markdown(f"**Chunk {i}**")
+                st.markdown(f"**Section {i}**")
                 st.write(chunk)
+else:
+    st.markdown(
+        """
+        <div class="steps">
+            <div class="step"><b>1. Get the transcript</b>
+                <span>Reads YouTube captions, or transcribes the audio with Whisper if none exist.</span></div>
+            <div class="step"><b>2. Split long videos</b>
+                <span>Breaks the text into sections so nothing is lost in a long talk.</span></div>
+            <div class="step"><b>3. Summarize</b>
+                <span>Combines section summaries into one overview and pulls out key terms.</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 st.divider()
 
-st.markdown('<div class="eyebrow">FUTURE SCOPE</div>', unsafe_allow_html=True)
+st.markdown('<p class="section-title">Coming next</p>', unsafe_allow_html=True)
 st.markdown(
     """
-    <div class="future-card">
-        <b>Live data mode.</b> Stream audio from a live lecture or webinar, transcribe it
-        in real time with Whisper, and maintain a rolling summary and keyword feed as the
-        session unfolds — turning any live talk into searchable notes on the fly.
+    <div class="future-note">
+        <b>Live mode.</b> Stream audio from a lecture or webinar, transcribe it in real
+        time with Whisper, and keep a rolling summary and keyword feed as the session
+        unfolds.
     </div>
     """,
     unsafe_allow_html=True,
