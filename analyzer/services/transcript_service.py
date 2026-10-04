@@ -1,12 +1,13 @@
 """
 Handles turning a YouTube URL into raw transcript text.
 
-Primary path: youtube-transcript-api pulls existing captions (fast, free,
-no audio download needed).
+Primary path:
+  1. youtube-transcript-api pulls existing captions (fast, free, no audio download needed).
+  2. yt-dlp direct subtitle extraction (fast JSON3/VTT parser, bypasses YouTube media stream 403 blocks).
 
-Fallback path: if no captions exist (disabled, auto-only in an unsupported
-language, or the API errors out), we download just the audio with yt-dlp
-and run it through Whisper locally.
+Fallback path:
+  3. If no captions exist anywhere, downloads audio with yt-dlp (emulating mobile/android client to prevent 403)
+     and transcribes with Whisper locally.
 """
 import os
 import re
@@ -15,9 +16,10 @@ import subprocess
 import sys
 import tempfile
 import json
+import logging
 from pathlib import Path
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
 from dataclasses import dataclass, field
 
 _YOUTUBE_ID_RE = re.compile(
@@ -25,6 +27,19 @@ _YOUTUBE_ID_RE = re.compile(
 )
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+_PREFERRED_TRANSCRIPT_LANGUAGES = ["en", "en-US", "en-GB", "hi"]
+_logger = logging.getLogger(__name__)
+
+
+class _YtDlpLogger:
+    def debug(self, message: str) -> None:
+        _logger.debug("%s", message)
+
+    def warning(self, message: str) -> None:
+        _logger.debug("%s", message)
+
+    def error(self, message: str) -> None:
+        _logger.debug("%s", message)
 
 
 @dataclass
@@ -33,6 +48,117 @@ class TranscriptResult:
     source: str
     video_id: str
     segments: list[dict[str, float | str]] = field(default_factory=list)
+
+
+def _dedupe_consecutive_caption_segments(
+    segments: list[dict[str, float | str]],
+) -> list[dict[str, float | str]]:
+    """Drop only adjacent captions that repeat the exact same text."""
+    deduplicated = []
+    previous_text = None
+    for segment in segments:
+        text = segment.get("text")
+        if not isinstance(text, str):
+            continue
+        normalized = re.sub(r"\W+", "", text.casefold(), flags=re.UNICODE)
+        if not normalized or normalized == previous_text:
+            continue
+        deduplicated.append(segment)
+        previous_text = normalized
+    return deduplicated
+
+
+def clean_transcript(text: str) -> str:
+    """Remove common speech fillers and caption artifacts without changing meaning."""
+    text = re.sub(r">{2,}", " ", text)
+    filler_pattern = r"\b(?:uh+|um+|erm+|er+)\b(?!-)"
+    text = re.sub(
+        rf"(?<=\w)(?:,\s*|\s+){filler_pattern}[,،]?\s*",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        rf"(?<!\w){filler_pattern}[,،]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"[ \t]+([,.;:!?])", r"\1", text)
+    text = re.sub(r"([,;:!?])(?=\S)", r"\1 ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def format_transcript_download(
+    title: str,
+    text: str,
+    segments: list[dict[str, float | str]],
+) -> str:
+    """Format a transcript as readable, timestamped paragraphs for text download."""
+    lines = [title.strip() or "Video transcript", "=" * 72, ""]
+    if segments:
+        paragraph_start: float | None = None
+        paragraph_parts: list[str] = []
+        paragraph_words = 0
+
+        def flush_paragraph() -> None:
+            if paragraph_start is None or not paragraph_parts:
+                return
+            timestamp = int(paragraph_start)
+            hours, remainder = divmod(timestamp, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            label = (
+                f"{hours:02}:{minutes:02}:{seconds:02}"
+                if hours
+                else f"{minutes:02}:{seconds:02}"
+            )
+            lines.append(f"[{label}] {' '.join(paragraph_parts)}")
+            lines.append("")
+
+        for segment in segments:
+            segment_text = segment.get("text")
+            if not isinstance(segment_text, str):
+                continue
+            cleaned = clean_transcript(segment_text)
+            if not cleaned:
+                continue
+
+            start = segment.get("start", 0.0)
+            segment_start = float(start) if isinstance(start, (int, float)) else 0.0
+            if paragraph_start is not None and (
+                segment_start - paragraph_start >= 30 or paragraph_words >= 70
+            ):
+                flush_paragraph()
+                paragraph_parts = []
+                paragraph_words = 0
+                paragraph_start = None
+            if paragraph_start is None:
+                paragraph_start = segment_start
+            paragraph_parts.append(cleaned)
+            paragraph_words += len(cleaned.split())
+        flush_paragraph()
+    else:
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?।])\s+", clean_transcript(text))
+            if sentence.strip()
+        ]
+        paragraph: list[str] = []
+        word_count = 0
+        for sentence in sentences:
+            sentence_words = len(sentence.split())
+            if paragraph and word_count + sentence_words > 80:
+                lines.append(" ".join(paragraph))
+                lines.append("")
+                paragraph = []
+                word_count = 0
+            paragraph.append(sentence)
+            word_count += sentence_words
+        if paragraph:
+            lines.append(" ".join(paragraph))
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def extract_video_id(url_or_id: str) -> str:
@@ -53,7 +179,8 @@ def get_video_title(url_or_id: str) -> str | None:
         {"url": video_url, "format": "json"}
     )
     try:
-        with urlopen(endpoint, timeout=5) as response:
+        req = Request(endpoint, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urlopen(req, timeout=5) as response:
             metadata = json.load(response)
         title = metadata.get("title")
         return title.strip() if isinstance(title, str) and title.strip() else None
@@ -61,39 +188,165 @@ def get_video_title(url_or_id: str) -> str | None:
         return None
 
 
-def _fetch_captions(video_id: str) -> str | None:
+def _fetch_captions_api(video_id: str) -> tuple[str, list[dict[str, float | str]]] | None:
+    """Fetch captions using youtube-transcript-api (supports both 1.x and 0.6.x)."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        from youtube_transcript_api._errors import (
-            NoTranscriptFound,
-            TranscriptsDisabled,
-            VideoUnavailable,
-        )
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "The transcript pipeline requires 'youtube-transcript-api'. "
-            "Install it with: pip install youtube-transcript-api"
-        ) from exc
+    except ModuleNotFoundError:
+        return None
 
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        # Prefer a manually created transcript, then fall back to any
-        # auto-generated one, translating to English if needed.
-        try:
-            transcript = transcript_list.find_manually_created_transcript(
-                ["en", "en-US", "en-GB"]
+        # Check if v1.x instance API is available
+        if hasattr(YouTubeTranscriptApi, "fetch") and callable(getattr(YouTubeTranscriptApi, "fetch", None)):
+            try:
+                api = YouTubeTranscriptApi()
+                transcript_list = api.list(video_id)
+                available_languages = {
+                    transcript.language_code for transcript in transcript_list
+                }
+                selected_language = next(
+                    (
+                        language
+                        for language in _PREFERRED_TRANSCRIPT_LANGUAGES
+                        if language in available_languages
+                    ),
+                    None,
+                )
+                if selected_language:
+                    fetched = transcript_list.find_transcript(
+                        [selected_language]
+                    ).fetch()
+                    segments = []
+                    words = []
+                    for chunk in fetched:
+                        txt = getattr(chunk, "text", "") or ""
+                        txt = txt.strip()
+                        if txt:
+                            start_time = float(getattr(chunk, "start", 0.0))
+                            dur_time = float(getattr(chunk, "duration", 0.0))
+                            segments.append({
+                                "start": round(start_time, 2),
+                                "end": round(start_time + dur_time, 2),
+                                "text": txt,
+                            })
+                            words.append(txt)
+                    if words:
+                        segments = _dedupe_consecutive_caption_segments(segments)
+                        return " ".join(
+                            str(segment["text"]) for segment in segments
+                        ), segments
+            except Exception as exc:
+                _logger.debug(
+                    "Caption API lookup failed for %s: %s", video_id, exc
+                )
+
+        # Check legacy get_transcript
+        if hasattr(YouTubeTranscriptApi, "get_transcript"):
+            fetched = YouTubeTranscriptApi.get_transcript(
+                video_id, languages=_PREFERRED_TRANSCRIPT_LANGUAGES
             )
-        except NoTranscriptFound:
-            transcript = transcript_list.find_generated_transcript(
-                [t.language_code for t in transcript_list] or ["en"]
-            )
-        fetched = transcript.fetch()
-        return " ".join(chunk["text"] for chunk in fetched if chunk["text"].strip())
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
-        return None
+            segments = []
+            words = []
+            for chunk in fetched:
+                txt = chunk.get("text", "").strip()
+                if txt:
+                    start_time = float(chunk.get("start", 0.0))
+                    dur_time = float(chunk.get("duration", 0.0))
+                    segments.append({
+                        "start": round(start_time, 2),
+                        "end": round(start_time + dur_time, 2),
+                        "text": txt,
+                    })
+                    words.append(txt)
+            if words:
+                segments = _dedupe_consecutive_caption_segments(segments)
+                return " ".join(
+                    str(segment["text"]) for segment in segments
+                ), segments
     except Exception as e:
-        print(f"[transcript_service] captions fetch failed for {video_id}: {e}")
+        _logger.debug("Legacy caption API lookup failed for %s: %s", video_id, e)
+
+    return None
+
+
+def _fetch_captions_ytdlp(video_id: str) -> tuple[str, list[dict[str, float | str]], str] | None:
+    """Fetch captions via yt-dlp metadata without downloading audio/video (bypasses 403 blocks)."""
+    try:
+        import yt_dlp
+    except ModuleNotFoundError:
         return None
+
+    ydl_opts = {
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "logger": _YtDlpLogger(),
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            subtitles = info.get("subtitles") or {}
+            auto_captions = info.get("automatic_captions") or {}
+
+            chosen_format = None
+            source_label = "captions"
+
+            for pool, label in [(subtitles, "captions"), (auto_captions, "auto-captions")]:
+                available_langs = list(pool.keys())
+                matched_lang = None
+                for pref in _PREFERRED_TRANSCRIPT_LANGUAGES:
+                    if pref in available_langs:
+                        matched_lang = pref
+                        break
+
+                if matched_lang:
+                    formats = pool[matched_lang]
+                    chosen_format = next(
+                        (f for f in formats if f.get("ext") == "json3"),
+                        formats[0] if formats else None,
+                    )
+                    if chosen_format:
+                        source_label = label
+                        break
+
+            if not chosen_format or "url" not in chosen_format:
+                return None
+
+            req = Request(
+                chosen_format["url"],
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            with urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+                data = json.loads(raw)
+                events = data.get("events", [])
+                segments = []
+                words = []
+                for ev in events:
+                    segs = ev.get("segs", [])
+                    line = "".join(s.get("utf8", "") for s in segs).strip()
+                    if line and line != "\n":
+                        t_start = ev.get("tStartMs", 0) / 1000.0
+                        t_dur = ev.get("dDurationMs", 0) / 1000.0
+                        segments.append({
+                            "start": round(t_start, 2),
+                            "end": round(t_start + t_dur, 2),
+                            "text": line,
+                        })
+                        words.append(line)
+                if words:
+                    segments = _dedupe_consecutive_caption_segments(segments)
+                    return (
+                        " ".join(str(segment["text"]) for segment in segments),
+                        segments,
+                        source_label,
+                    )
+    except Exception as e:
+        _logger.debug("yt-dlp caption lookup failed for %s: %s", video_id, e)
+
+    return None
 
 
 def _download_audio(video_id: str, out_dir: str) -> str:
@@ -111,6 +364,12 @@ def _download_audio(video_id: str, out_dir: str) -> str:
         "outtmpl": out_path,
         "quiet": True,
         "noplaylist": True,
+        "logger": _YtDlpLogger(),
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web"]
+            }
+        },
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -152,11 +411,9 @@ def _download_audio(video_id: str, out_dir: str) -> str:
         if "403" in detail or "forbidden" in detail.lower():
             raise RuntimeError(
                 "YouTube refused the audio download (HTTP 403). This can happen "
-                "when YouTube blocks the current session or restricts the video. "
-                "If you are signed in to YouTube in a supported browser, set "
-                "YTDLP_COOKIES_FROM_BROWSER to that browser name and restart the "
-                "app. Otherwise, paste the transcript directly. "
-                f"yt-dlp {yt_dlp.version.__version__} reported: {detail}"
+                "when YouTube blocks automated audio streaming. "
+                "Try another video with captions available, or try again later. "
+                f"(Detail: {detail})"
             ) from e
         raise RuntimeError(
             f"Couldn't download audio for this video: {detail}"
@@ -191,10 +448,25 @@ def _transcribe_with_faster_whisper(
 def get_transcript(url_or_id: str) -> TranscriptResult:
     video_id = extract_video_id(url_or_id)
 
-    captions = _fetch_captions(video_id)
-    if captions:
-        return TranscriptResult(text=captions, source="captions", video_id=video_id)
+    # 1. Try youtube-transcript-api
+    api_result = _fetch_captions_api(video_id)
+    if api_result:
+        text, segments = api_result
+        if text.strip():
+            return TranscriptResult(
+                text=text, source="captions", video_id=video_id, segments=segments
+            )
 
+    # 2. Try yt-dlp direct subtitle extraction (no audio download)
+    ytdlp_result = _fetch_captions_ytdlp(video_id)
+    if ytdlp_result:
+        text, segments, source_label = ytdlp_result
+        if text.strip():
+            return TranscriptResult(
+                text=text, source=source_label, video_id=video_id, segments=segments
+            )
+
+    # 3. Fallback: Download audio and run faster-whisper
     with tempfile.TemporaryDirectory() as tmp_dir:
         audio_path = _download_audio(video_id, tmp_dir)
         try:

@@ -1,66 +1,59 @@
-# Video Analyzer — Django + Streamlit
+# YouTube Video Analyzer
 
-Same pipeline as before (captions → Whisper fallback → chunked summarization
-→ keyword extraction), rebuilt with a Django REST API backend and a
-Streamlit frontend with a professional theme (deep teal accent, off-white
-background, restrained borders — no dark/red landing-page styling).
+A Streamlit app that gets captions (or transcribes audio), cleans the transcript,
+and creates a concise report locally with BART. Reports can be written in
+English or Hindi.
 
-## Structure
-```
-backend_django/          Django + DRF API
-  analyzer_project/      settings, urls, wsgi
-  analyzer/
-    views.py             /api/analyze/, /api/health/
-    serializers.py
-    services/            transcript_service.py, summarizer.py, keywords.py
-                          (unchanged logic from the FastAPI version)
-streamlit_frontend/
-  app.py                 UI
-  .streamlit/config.toml theme colors
-```
+## Setup on Windows
 
-## Run the backend
-```bash
-cd backend_django
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-sudo apt install ffmpeg      # needed for the Whisper fallback path
+1. From the project folder, create and activate a Python environment, then
+   install the project dependencies:
 
-python manage.py runserver 0.0.0.0:8000
-```
+   ```powershell
+   py -3.12 -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   ```
 
-For GPU acceleration on your RTX 4050:
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-```
+2. Start the app:
 
-## Run the frontend
-```bash
-cd streamlit_frontend
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+   ```powershell
+   streamlit run app.py
+   ```
 
-streamlit run app.py
-```
+   Open the local URL printed by Streamlit, usually `http://localhost:8501`.
 
-Opens at `http://localhost:8501` and talks to the Django API at
-`http://localhost:8000/api/analyze/`.
+The first report may take longer while the `facebook/bart-large-cnn` model
+downloads. Report generation then runs on this device and does not require an
+API key or send the transcript to a cloud model.
 
-## API
-Same contract as before:
-```
-POST /api/analyze/
-{ "mode": "url", "content": "https://www.youtube.com/watch?v=..." }
-```
-or `"mode": "transcript"` with raw transcript text in `content`.
+## What it does
 
-## Notes
-- No database is configured — the API is stateless (analyze → return, nothing
-  persisted). If you later want history/saved analyses, add a model + SQLite
-  and a `POST /api/history/` endpoint.
-- CORS is wide open between :8501 and :8000 for local dev — tighten
-  `CORS_ALLOW_ALL_ORIGINS` in `settings.py` if you deploy this.
-- Theme colors live in `streamlit_frontend/.streamlit/config.toml` — change
-  `primaryColor`/`backgroundColor` there to retheme without touching `app.py`.
+- Enter a YouTube link. The app tries English captions (including regional
+  English captions), then Hindi captions, then local speech recognition if
+  captions cannot be fetched.
+- Reports can be written in English or Hindi. BART summarizes English text, so
+  Hindi transcripts and Hindi output use local translation models, which
+  download the first time they are needed.
+- Key points are shown as plain text without labels such as “Claim” or
+  “Proposal.” BART summaries can still make mistakes, so review important
+  details against the downloaded transcript.
+- Download the cleaned transcript as a readable `.txt` file with timestamped
+  paragraphs. Common fillers such as “uh” and “um” and caption artifacts such
+  as `>>` are removed; meaningful words such as “oh” are kept.
+- Consecutive identical caption segments are removed. Long transcripts are split
+  into word-sized sections, summarized locally in batches, and combined into one
+  report.
+
+The About page lists suitable video types and explains limitations. Captions
+and audio still need to be accessible through YouTube; private videos and live
+streams may not work. The app does not join live meetings or identify speakers
+by name.
+
+## Privacy and limitations
+
+Speech recognition, report generation, and translation run on this device.
+The BART and translation models download from their model repositories the first
+time they are used, so internet access is needed for initial setup. YouTube
+caption and audio retrieval also requires an internet connection. Generated
+summaries can make mistakes, so review important details against the transcript.

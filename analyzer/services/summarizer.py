@@ -1,42 +1,13 @@
-"""
-Chunk + summarize. Long transcripts (1hr+ videos) get split into
-model-sized pieces, each summarized independently, then the partial
-summaries are combined and summarized once more into a final summary.
-This "map-reduce" approach keeps quality up without truncating content.
-"""
+"""Generate a transcript summary with the local BART summarization model."""
 
 import re
-import json
+from collections import Counter
+from collections.abc import Callable
 
-_summarizer = None
 MODEL_NAME = "facebook/bart-large-cnn"
-
-# BART's practical input limit is ~1024 tokens; we chunk on words as a
-# cheap proxy (~1 token ≈ 0.75 words for English) and stay well under it.
 WORDS_PER_CHUNK = 350
-REPORT_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
-_report_model = None
-
-_REPORT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "tldr": {"type": "string"},
-        "key_points": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 4,
-            "maxItems": 6,
-        },
-        "overview": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 2,
-            "maxItems": 3,
-        },
-    },
-    "required": ["tldr", "key_points", "overview"],
-    "additionalProperties": False,
-}
+SUMMARIZATION_BATCH_SIZE = 4
+_summarizer = None
 
 
 def _get_summarizer():
@@ -44,228 +15,194 @@ def _get_summarizer():
     if _summarizer is None:
         try:
             import torch
-            from transformers import pipeline
+            from transformers import AutoTokenizer, pipeline
         except ModuleNotFoundError as exc:
             raise RuntimeError(
-                "The summarizer requires 'transformers' and 'torch'. "
-                "Install them with: pip install transformers torch"
+                "BART summarization requires 'transformers' and 'torch'. "
+                "Install project dependencies with: pip install -r requirements.txt"
             ) from exc
 
         device = 0 if torch.cuda.is_available() else -1
-        _summarizer = pipeline("summarization", model=MODEL_NAME, device=device)
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_NAME, clean_up_tokenization_spaces=True
+        )
+        _summarizer = pipeline(
+            "summarization",
+            model=MODEL_NAME,
+            tokenizer=tokenizer,
+            device=device,
+        )
     return _summarizer
 
 
-def _get_report_model():
-    global _report_model
-    if _report_model is None:
-        try:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "The report generator requires 'transformers' and 'torch'. "
-                "Install them with: pip install transformers torch"
-            ) from exc
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if device == "cuda" else torch.float32
-        tokenizer = AutoTokenizer.from_pretrained(REPORT_MODEL_NAME)
-        model = AutoModelForCausalLM.from_pretrained(
-            REPORT_MODEL_NAME, torch_dtype=dtype
-        ).to(device)
-        _report_model = (model, tokenizer)
-    return _report_model
-
-
-def chunk_text(text: str, words_per_chunk: int = WORDS_PER_CHUNK) -> list[str]:
+def split_words(text: str, words_per_chunk: int = WORDS_PER_CHUNK) -> list[str]:
     words = text.split()
-    if not words:
-        return []
+    if words_per_chunk < 1:
+        raise ValueError("words_per_chunk must be greater than zero.")
     return [
-        " ".join(words[i : i + words_per_chunk])
-        for i in range(0, len(words), words_per_chunk)
+        " ".join(words[index : index + words_per_chunk])
+        for index in range(0, len(words), words_per_chunk)
     ]
 
 
-def _summarize_one(text: str, max_len: int = 220, min_len: int = 40) -> str:
-    word_count = len(text.split())
-    if word_count < 20:
-        return text  # too short to meaningfully summarize
-    # Keep the model's max/min sane relative to input length.
-    max_len = min(max_len, max(min_len + 10, int(word_count * 0.8)))
-    summarizer = _get_summarizer()
-    result = summarizer(
-        text, max_length=max_len, min_length=min(min_len, max_len - 5), do_sample=False
+def _summarize_many(
+    texts: list[str],
+    summarizer,
+    max_length: int = 120,
+    min_length: int = 20,
+) -> list[str]:
+    summaries = [""] * len(texts)
+    pending = [
+        (index, text)
+        for index, text in enumerate(texts)
+        if len(text.split()) >= 20
+    ]
+    for index, text in enumerate(texts):
+        if len(text.split()) < 20:
+            summaries[index] = text.strip()
+
+    if not pending:
+        return summaries
+
+    results = summarizer(
+        [text for _, text in pending],
+        batch_size=SUMMARIZATION_BATCH_SIZE,
+        max_length=max_length,
+        min_length=min(min_length, max_length - 5),
+        do_sample=False,
     )
-    summary = result[0]["summary_text"].strip()
-    if not re.search(r"[.!?][\"')\]]*$", summary):
-        last_boundary = max(summary.rfind("."), summary.rfind("!"), summary.rfind("?"))
-        if last_boundary > 0:
-            summary = summary[: last_boundary + 1].rstrip()
-    return summary
+    if not isinstance(results, list) or len(results) != len(pending):
+        raise RuntimeError("BART returned an incomplete transcript summary batch.")
+
+    for (index, _), result in zip(pending, results):
+        summary = result.get("summary_text") if isinstance(result, dict) else None
+        if not isinstance(summary, str) or not summary.strip():
+            raise RuntimeError("BART returned an empty summary for a transcript section.")
+        summaries[index] = summary.strip()
+    return summaries
 
 
-def summarize_long_text(text: str) -> dict:
-    chunks = chunk_text(text)
+def _split_sentences(text: str) -> list[str]:
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?।])\s+", text.strip())
+        if sentence.strip()
+    ]
+
+
+def _deduplicate_sentences(sentences: list[str]) -> list[str]:
+    unique = []
+    seen = set()
+    for sentence in sentences:
+        normalized = re.sub(r"[^\w]+", " ", sentence.casefold()).strip()
+        if normalized and normalized not in seen:
+            unique.append(sentence)
+            seen.add(normalized)
+    return unique
+
+
+def _limit_words(text: str, word_limit: int) -> str:
+    words = text.split()
+    if len(words) <= word_limit:
+        return text
+    return " ".join(words[:word_limit]).rstrip(" ,;:") + "."
+
+
+def _is_degenerate(text: str) -> bool:
+    words = re.findall(r"\b[\w']+\b", text.casefold())
+    if not words:
+        return True
+    if len(words) < 12:
+        return False
+    if len(set(words)) / len(words) < 0.35:
+        return True
+    repeated_phrases = Counter(
+        tuple(words[index : index + 4]) for index in range(len(words) - 3)
+    )
+    return any(
+        count >= 3 and count * 4 >= len(words) * 0.5
+        for count in repeated_phrases.values()
+    )
+
+
+def summarize_long_text(
+    text: str, progress_callback: Callable[[str], None] | None = None
+) -> dict:
+    chunks = split_words(text)
     if not chunks:
-        return {"summary": "", "chunk_count": 0, "chunk_summaries": []}
+        raise ValueError("The transcript is empty.")
 
-    chunk_summaries = [_summarize_one(c) for c in chunks]
+    summarizer = _get_summarizer()
+    if progress_callback:
+        progress_callback(
+            f"Summarizing {len(chunks)} transcript section(s) with BART..."
+        )
+    chunk_summaries = _summarize_many(chunks, summarizer)
     reduced_summaries = chunk_summaries
     while len(reduced_summaries) > 1:
-        combined = " ".join(reduced_summaries)
-        reduction_chunks = chunk_text(combined)
-        next_summaries = [
-            _summarize_one(chunk, max_len=320, min_len=60)
-            for chunk in reduction_chunks
-        ]
-        if sum(len(item.split()) for item in next_summaries) >= len(combined.split()):
+        reduction_chunks = split_words(
+            " ".join(reduced_summaries), WORDS_PER_CHUNK
+        )
+        if len(reduction_chunks) >= len(reduced_summaries):
+            break
+        if progress_callback:
+            progress_callback(
+                f"Combining {len(reduced_summaries)} BART section summaries..."
+            )
+        next_summaries = _summarize_many(
+            reduction_chunks,
+            summarizer,
+            max_length=160,
+            min_length=35,
+        )
+        if sum(len(item.split()) for item in next_summaries) >= sum(
+            len(item.split()) for item in reduced_summaries
+        ):
             break
         reduced_summaries = next_summaries
+    combined = " ".join(reduced_summaries)
 
-    final_summary = " ".join(reduced_summaries)
-
+    if _is_degenerate(combined):
+        raise RuntimeError(
+            "Couldn't generate a reliable summary from this transcript. "
+            "Please try again or use a clearer transcript."
+        )
     return {
-        "summary": final_summary,
+        "summary": combined,
         "chunk_count": len(chunks),
         "chunk_summaries": chunk_summaries,
     }
 
 
-def _sentence_end(text: str) -> str:
-    sentence = re.split(r"(?<=[.!?])\s+", text.strip(), maxsplit=1)[0]
-    return sentence if sentence.endswith((".", "!", "?")) else sentence + "."
+def create_video_report(
+    text: str,
+    progress_callback: Callable[[str], None] | None = None,
+    *,
+    output_language: str = "en",
+) -> dict:
+    if output_language not in {"en", "hi"}:
+        raise ValueError("Report language must be English or Hindi.")
 
-
-def _sample_ordered_sentences(sentences: list[str], limit: int) -> list[str]:
-    if len(sentences) <= limit:
-        return sentences
-    indexes = [round(index * (len(sentences) - 1) / (limit - 1)) for index in range(limit)]
-    return [sentences[index] for index in indexes]
-
-
-def _evidence_supported(value: str, evidence: str) -> bool:
-    stop_words = {
-        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
-        "how", "in", "into", "is", "it", "of", "on", "or", "that", "the",
-        "their", "this", "to", "was", "were", "what", "when", "which", "with",
-    }
-    evidence_words = set(re.findall(r"[a-z0-9]+", evidence.lower()))
-    claim_words = set(re.findall(r"[a-z0-9]+", value.lower())) - stop_words
-    return bool(claim_words) and claim_words <= evidence_words
-
-
-def _fallback_report(summary_data: dict, source_text: str) -> dict:
-    summary = summary_data["summary"].strip()
-    summary_sentences = []
-    for chunk_summary in summary_data["chunk_summaries"]:
-        summary_sentences.extend(
-            part.strip()
-            for part in re.split(r"(?<=[.!?])\s+", chunk_summary)
-            if len(part.split()) >= 6
+    summary_data = summarize_long_text(text, progress_callback)
+    key_points = _deduplicate_sentences(
+        [
+            sentence
+            for chunk_summary in summary_data["chunk_summaries"]
+            for sentence in _split_sentences(chunk_summary)
+        ]
+    )[:7]
+    if not key_points or _is_degenerate(" ".join(key_points)):
+        raise RuntimeError(
+            "Couldn't generate a reliable summary from this transcript. "
+            "Please try again or use a clearer transcript."
         )
-    unique_summary_sentences = list(dict.fromkeys(summary_sentences))
-    source_sentences = [
-        part.strip()
-        for part in re.split(r"(?<=[.!?])\s+", source_text)
-        if len(part.split()) >= 6
-    ]
-    source_sentences = list(dict.fromkeys(source_sentences))
-    point_candidates = source_sentences or unique_summary_sentences
-    key_points = _sample_ordered_sentences(point_candidates, 6)
-    if len(key_points) < 4:
-        for sentence in point_candidates:
-            clauses = re.split(r"\s+(?:and|then|finally)\s+|,\s+", sentence)
-            key_points.extend(
-                clause.strip().rstrip(".,;:") + "."
-                for clause in clauses
-                if len(clause.split()) >= 4 and clause.strip() not in key_points
-            )
-            if len(key_points) >= 4:
-                break
-        key_points = key_points[:6]
-    if not key_points:
-        key_points = [_sentence_end(summary)]
 
-    overview_sentences = _sample_ordered_sentences(
-        source_sentences or unique_summary_sentences, 6
-    )
-    if not overview_sentences:
-        overview_sentences = [_sentence_end(summary)]
-    midpoint = max(1, (len(overview_sentences) + 1) // 2)
-    overview = [
-        " ".join(overview_sentences[:midpoint]),
-        " ".join(overview_sentences[midpoint:]) or overview_sentences[-1],
-    ]
-    tldr_candidates = unique_summary_sentences
-    if len(tldr_candidates) < 2:
-        tldr_candidates = source_sentences or [_sentence_end(summary)]
-    tldr_parts = _sample_ordered_sentences(tldr_candidates, 3)
-    tldr = "; ".join(part.rstrip(".!? ") for part in tldr_parts) + "."
+    overview = _split_sentences(summary_data["summary"])
+    tldr = _limit_words(" ".join(overview[:2] or key_points[:1]), 40)
     return {
         "tldr": tldr,
         "key_points": key_points,
-        "overview": overview,
-    }
-
-
-def create_video_report(text: str) -> dict:
-    summary_data = summarize_long_text(text)
-    evidence = " ".join(summary_data["chunk_summaries"])
-    grounding_text = f"{text} {evidence}"
-    try:
-        import torch
-        from lmformatenforcer import JsonSchemaParser
-        from lmformatenforcer.integrations.transformers import (
-            build_transformers_prefix_allowed_tokens_fn,
-        )
-
-        model, tokenizer = _get_report_model()
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Write a faithful report using only facts in the source. "
-                    "Do not add advice, examples, or claims. TLDR is one sentence. "
-                    "Key points are distinct and concise. Overview contains two "
-                    "short paragraphs describing events in their original order."
-                ),
-            },
-            {"role": "user", "content": f"Source transcript summary:\n{evidence}"},
-        ]
-        input_ids = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
-        ).to(model.device)
-        allowed_tokens = build_transformers_prefix_allowed_tokens_fn(
-            tokenizer, JsonSchemaParser(_REPORT_SCHEMA)
-        )
-        with torch.inference_mode():
-            output = model.generate(
-                input_ids,
-                attention_mask=torch.ones_like(input_ids),
-                max_new_tokens=420,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-                prefix_allowed_tokens_fn=allowed_tokens,
-            )
-        generated = tokenizer.decode(
-            output[0][input_ids.shape[1] :], skip_special_tokens=True
-        )
-        report = json.loads(generated)
-        if not all(
-            _evidence_supported(value, grounding_text)
-            for value in [report["tldr"], *report["key_points"], *report["overview"]]
-        ):
-            report = _fallback_report(summary_data, text)
-    except Exception:
-        report = _fallback_report(summary_data, text)
-
-    report["tldr"] = _sentence_end(report["tldr"])
-    report["key_points"] = report["key_points"][:6]
-    report["overview"] = report["overview"][:3]
-    return {
-        **report,
+        "overview": [summary_data["summary"]],
         "chunk_count": summary_data["chunk_count"],
         "chunk_summaries": summary_data["chunk_summaries"],
     }
