@@ -5,6 +5,4 @@ __pycache__/
 .env.*
 !.env.example
 .vscode/
-ffmpeg.exe
-ffplay.exe
-ffprobe.exe
+*.exe

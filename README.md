@@ -15,7 +15,14 @@ English or Hindi.
    pip install -r requirements.txt
    ```
 
-2. Start the app:
+2. Install FFmpeg (needed only for the audio-transcription fallback) and make
+   sure it is on your `PATH`:
+
+   ```powershell
+   winget install Gyan.FFmpeg
+   ```
+
+3. Start the app:
 
    ```powershell
    streamlit run app.py
